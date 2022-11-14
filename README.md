@@ -23,13 +23,10 @@ NodeJS Websocket Upload,  multiple files upload
 <b>Client CallBack Example:</b>
   ```
   websocket_upload_c.set_callback({ 
-      start_cb: (start_info) => {
-          console.log("start ", start_info);
-      },
       process_cb: (info) => {
           console.log("process_cb ", info.pct);
       },
-      complte_cb: (info) => {
+      complete_cb: (info) => {
           console.log("complte_cb ", info);
       }
   });
