@@ -1,9 +1,9 @@
-﻿
+
 
 
 var WUtil = {
 
-	//小端模式
+ 
 	BytesToInt: function (bytes) {
 		var val = 0;
 		for (var i = bytes.length - 1; i >= 0; i--) {
@@ -15,7 +15,7 @@ var WUtil = {
 		return val;
 	},
 
-	//小端模式 
+ 
 	IntToBytes: function (number, length = 4) {
 		var bytes = [];
 		var i = 0;
@@ -25,8 +25,7 @@ var WUtil = {
 		} while (i < length)
 		return bytes;
 	},
-
-	// 合并
+	 
 	concat2: function(...arrays) {
 
 		let totalLen = 0; 
@@ -125,19 +124,22 @@ var WUtil = {
 };
 
 const msg_auth = 5;
+const msg_info = 8;
 const msg_uploadstart = 10;
 const msg_uploadproc = 20;
 const msg_uploadcomplete = 30;
-const maxChunkSize =  5e+7; // 50mb
+const maxChunkSize =    5e+7; // 50mb
 
 var websocket_upload_c = {
 
 	ws: null,
 	auth_cb: null,
+	info_cb: null,
 	start_cb: null,
 	process_cb: null,
-	complte_cb: null, 
+	complete_cb: null, 
 	uploader: {},
+	upload_files:[],
 	auth_code: null,
 	auth_state: false,
 
@@ -159,29 +161,47 @@ var websocket_upload_c = {
 
 			b.arrayBuffer().then(res => {
 				
-				var msgid = WUtil.BytesToInt(Array.from(new Uint8Array(res).slice(0,4)));
-				//console.log(" msgid = " + msgid);  
+				var msgid = WUtil.BytesToInt(Array.from(new Uint8Array(res).slice(0,4))); 
 				
-				var s = null; 
-				if (msgid === msg_auth || msgid === msg_uploadstart || msgid === msg_uploadproc || msgid === msg_uploadcomplete) {
-					s = JSON.parse(WUtil.Utf8ArrayToStr(new Uint8Array(res).slice(4)));
-					//console.log(" msg = " , s);
-				}
+				var s = JSON.parse(WUtil.Utf8ArrayToStr(new Uint8Array(res).slice(4)));
 
 				switch (msgid) {
 					case msg_auth: 
 						var authstat = s.auth;
 						if (authstat) {
 							t.auth_state = true;
-						} 
+						}
+
 						if (t.auth_cb)
 							t.auth_cb(authstat);
 
 						break;
-					case msg_uploadstart: 
-						t._add_uploads_queue(s); 
+					case msg_info:
+						if (t.info_cb)
+							t.info_cb(s); 
+						break;
+					case msg_uploadstart:
+
+						for (let i = 0; i < s.length; i++) {
+							let index = t._find_upload_file(s[i].name); 
+							if (index >= 0) { 
+								var u = t.upload_files[index];
+								var id = s[i].id;
+								t.uploader[id] = {
+									id: id,
+									cache_size: 0,
+									file: u.file,
+									size: u.size,
+									type: u.type,
+									name: u.name,
+									date: u.lastModified, 
+								}
+                            }
+						}  
+
 						if (t.start_cb)
-							t.start_cb(s); 
+							t.start_cb(s);
+
 						t._start_proc();
 
 						break;
@@ -204,8 +224,8 @@ var websocket_upload_c = {
 						}
 						break;
 					case msg_uploadcomplete: 
-						if (t.complte_cb)
-							t.complte_cb({
+						if (t.complete_cb)
+							t.complete_cb({
 								id: s.id,
 								name: t.uploader[s.id].name,
 							});
@@ -218,16 +238,32 @@ var websocket_upload_c = {
 
 	},
 
-	_add_uploads_queue: function (files) {
-		var t = this; 
-		for (let i = 0; i < files.length; i++) {
-			var hash = files[i].id;
-			if (t.uploader[hash]) {
-				t.uploader[hash].cache_size = files[i].cache_size;
-            }
-		} 
+	_add_upload_file_when_server: function (file) {
+		this.upload_files.push({
+			name: file.name,
+			file: file,
+			size: file.size,
+			type: file.type, 
+			date: file.lastModified,
+		});
 	},
 
+	_find_upload_file: function (filename) {
+		for (let i = 0; i < this.upload_files.length; i++) {
+			if (filename === this.upload_files[i].name) {
+				return i;
+            }
+		}
+		return -1;
+    },
+	_del_upload_file: function (filename) {
+		let i = this._find_upload_file(filename);
+		if (i >= 0) {
+			this._find_upload_file.splice(i);
+        }
+    },
+
+  
 	_start_proc: function () {
 		var t = this; 
 		for (let key in t.uploader) {
@@ -275,17 +311,7 @@ var websocket_upload_c = {
 				date: files[i].lastModified,
 			});
 
-			var hash = files[i].name + '_' + files[i].size + '_' + files[i].lastModified;
-			if (!t.uploader[hash]) {
-				t.uploader[hash] = {
-					cache_size: 0,
-					file: files[i],
-					size: files[i].size,
-					type: files[i].type,
-					name: files[i].name,
-					date: files[i].lastModified, 
-                }
-            }
+			t._add_upload_file_when_server(files[i]); 
 		}
 		t._send_message(msg_uploadstart, JSON.stringify(files_info));
     },
@@ -297,12 +323,14 @@ var websocket_upload_c = {
 		if (callbacks) {
 			if (callbacks["auth_cb"])
 				t.auth_cb = callbacks["auth_cb"];
+			if (callbacks["info_cb"])
+				t.info_cb = callbacks["info_cb"];
 			if (callbacks["start_cb"])
 				t.start_cb = callbacks["start_cb"];
 			if (callbacks["process_cb"])
 				t.process_cb = callbacks["process_cb"];
-			if (callbacks["complte_cb"])
-				t.complte_cb = callbacks["complte_cb"];
+			if (callbacks["complete_cb"])
+				t.complete_cb = callbacks["complete_cb"];
 		}
 
     },
@@ -310,7 +338,40 @@ var websocket_upload_c = {
 
 	upload: function (files) { 
 		this._get_fils_ids(files);
-	}
+	},
+
+
+	upload_direct: function (files, files_info) {
+
+		var t = this;
+
+		for (var f = 0; f < files.length; f++) {
+			t._add_upload_file_when_server(files[f]);
+		} 
+
+		for (let i = 0; i < files_info.length; i++) {
+			let index = t._find_upload_file(files_info[i].name);  
+			if (index >= 0) {
+				var u = t.upload_files[index];  
+				var id = files_info[i].id;  
+				t.uploader[id] = {
+					id: id,
+					cache_size: 0,
+					file: u.file,
+					size: u.size,
+					type: u.type,
+					name: u.name,
+					date: u.lastModified,
+				}
+			}
+		}
+
+		if (t.start_cb)
+			t.start_cb(files_info);
+
+		t._start_proc();
+
+    }
 
 
 
