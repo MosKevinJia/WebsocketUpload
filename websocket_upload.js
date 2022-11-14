@@ -1,25 +1,33 @@
-﻿'use strict';
+'use strict';
 const WebSocket = require('ws');
 const uuid = require('uuid');
 const jetpack = require('fs-jetpack');  
 var path = require("path"); 
  
-var client_ids = 0;  
+var client_ids = 0;
+var clients = [];
 var uploadprocs = {};
 var wss = null;
 var upload_path = "../public/cache"; 
 var need_auth = false;
 var auth_codes = {};
 
-// msgid(4位), string_byte[......]
+var callbacks = {
+	auth_cb: null,
+	start_cb: null,
+	process_cb: null,
+	complete_cb: null, 
+}
 
+// msgid(4位), string_byte[......]
 // msgid(4位), hash_length(4位), hash_str(...), filebyte[......]
 
 
 const msg_auth = 5;
+const msg_info = 8;
 const msg_uploadstart = 10;
 const msg_uploadproc = 20;
-const msg_uploadcomplete = 30;
+const msg_uploadcomplete = 30; 
 
 
 function sendmsg(client, msgid, msg) { 
@@ -33,7 +41,7 @@ function sendmsg(client, msgid, msg) {
 // 添加上传队列
 function addUploadQueue(client, file_info) {
 
-	var hash = file_info.name + '_' + file_info.size + '_' + file_info.date;
+	var hash = uuid.v4() + '_' + file_info.size + '_' + file_info.date;
 	if (!uploadprocs[hash]) {
 
 		var cachefilename = uuid.v4();   // 缓存文件名
@@ -47,6 +55,7 @@ function addUploadQueue(client, file_info) {
 			cache_size: 0,  
 			cache_name: cachefilename,
 			cache_path: filepath,
+			suffix: file_info.name.split('.').pop(),
 		}
 
 		jetpack.dir(`${filepath}`);
@@ -56,6 +65,7 @@ function addUploadQueue(client, file_info) {
 
 	return {
 		id: hash,
+		name: uploadprocs[hash].name,
 		cache_size: uploadprocs[hash].cache_size
 	}
  
@@ -74,14 +84,32 @@ function appendUploadBuff(hash, data) {
 
 		if (c.cache_size >= c.size) {
 			// 完成
-			jetpack.rename(fullpath, c.name, { overwrite: true }); 
-			sendmsg(c.client, msg_uploadcomplete, JSON.stringify({ 
+
+			if (!wsu.isRename) {
+				jetpack.rename(fullpath, c.name, { overwrite: true });
+				fullpath = `${c.cache_path}\\${c.name}`;
+			} else {
+				var cachefilename = c.cache_name + "." + c.suffix;
+				jetpack.rename(fullpath, cachefilename, { overwrite: true });
+				fullpath = `${c.cache_path}\\${cachefilename}`;
+            }
+
+			sendmsg(c.client, msg_uploadcomplete, JSON.stringify({
 				id: hash,
 				cache_size: c.cache_size,
 				state: "ok"
 			}));
 
 			uploadprocs[hash] = null;
+
+			if (callbacks.complete_cb)
+				callbacks.complete_cb({
+					path: fullpath,
+					name: c.name,
+					hash: hash,
+					size: c.cache_size,
+					auth: c.client.auth,
+				});
 
 		} else {
 			// 继续
@@ -90,6 +118,13 @@ function appendUploadBuff(hash, data) {
 				cache_size: c.cache_size,
 				state: "upload"
 			}));
+
+			if (callbacks.process_cb)
+				callbacks.process_cb({
+					name: c.name,
+					hash: hash,
+					size: c.cache_size
+				});
 
         }
 
@@ -102,19 +137,27 @@ function startUploadServer(port) {
 
 	wss = new WebSocket.Server({
 		port: port,
-		maxPayload: 0 //9.9e+7 // 99mb
+		maxPayload: 0//9.9e+7 // 99mb
 	});
-
 
 	wss.on('connection', function connection(client) {
 
-		client.ids = client_ids++; 
-		//sendmsg(client, msg_auth, JSON.stringify({ need_auth: need_auth, client_id: client.ids }));
- 
+		client.ids = client_ids++;
+		clients.push(client);
+
+		client.on('close', (code, reason) => { 
+			for (let i = 0; i < clients.length; i++) {
+				if (clients[i] && clients[i].ids === client.ids) {
+					clients[i] = null;
+					clients.splice(i);
+                }
+            } 
+		});
+
 		client.on('message', async data => {
 
 			var msgid = WUtil.BytesToInt(data.slice(0, 4));
-			console.log(" msgid = " + msgid);
+			//console.log(" msgid = " + msgid);
 
 			switch (msgid) {
 
@@ -127,15 +170,21 @@ function startUploadServer(port) {
 
 						if (authjson.auth) {
 							is_auth = auth_codes[authjson.auth];
-						} else {
-							is_auth = true;
 						}
+
 					} else {
 						is_auth = true;
                     }
 
 					client.auth = is_auth;  
 					sendmsg(client, msg_auth, JSON.stringify({ auth: is_auth }));
+
+					if (callbacks.auth_cb)
+						callbacks.auth_cb(client, is_auth);
+
+					break;
+				case msg_info:
+
 
 					break;
 				case msg_uploadstart: 
@@ -144,10 +193,17 @@ function startUploadServer(port) {
 					var msg = WUtil.Utf8ArrayToStr(data.slice(4));
 					var filesjson = JSON.parse(msg.toString());
 					var infos = [];
+					var cbinfo = [];
 					for (let i = 0; i < filesjson.length; i++) {
-						infos.push(addUploadQueue(client, filesjson[i]));
+						var u = addUploadQueue(client, filesjson[i]);
+						infos.push(u);
+						cbinfo.push(uploadprocs[u.id]);
 					}
 					sendmsg(client, msg_uploadstart, JSON.stringify(infos));
+
+					if (callbacks.start_cb)
+						callbacks.start_cb(cbinfo);
+
 					break;
 				case msg_uploadproc: 
 					if (need_auth && !client.auth)
@@ -155,7 +211,8 @@ function startUploadServer(port) {
 					var hashlen = WUtil.BytesToInt(data.slice(4, 8)); 
 					var hash = WUtil.Utf8ArrayToStr(data.slice(8, 8 + hashlen));
 					var d = data.slice(8 + hashlen); 
-					appendUploadBuff(hash, d);
+					appendUploadBuff(hash, d); 
+					
 					break;
             } 
 		});
@@ -322,14 +379,15 @@ var WUtil = {
 
 var wsu = {
 
+	// 是否重新命名(flase=video1.mp4   true=DLELKDJFE232.mp4)
+	isRename: true,
+
 	//初始化
 	init: function (port, _folder ) {
-		startUploadServer(port);
-
+		startUploadServer(port); 
 		if (_folder) {
 			upload_path = _folder;
-		} 
-		
+		}  
 	},
 
 	// 设置验证code
@@ -340,8 +398,57 @@ var wsu = {
         }
 	},
 
+	// 
+	findClient: function (_auth_code) {
+
+		for (var i = 0; i < clients.length; i++) {
+			if (clients[i].auth && clients[i].auth === _auth_code) {
+				return clients[i];
+            }
+        }
+    },
+
+	// 添加验证
 	add_auth_code: function (auth_code) {
 		auth_codes[auth_code] = auth_code;
+	},
+
+	// 删除验证
+	del_auth_code: function (auth_code) {
+		auth_codes[auth_code] = null;
+		delete auth_codes[auth_code];
+    },
+
+	// 设置回调
+	set_callback: function (_callbacks) {
+		callbacks = _callbacks;
+	},
+
+	// 设置路径
+	set_cache_path: function (_path) {
+		upload_path = _path;
+	},
+
+	//
+	addQueues: function (client, files) {
+
+		var infos = [];
+		var cbinfo = [];
+		for (let i = 0; i < files.length; i++) {
+			var u = addUploadQueue(client, files[i]);
+			infos.push(u);
+			cbinfo.push(uploadprocs[u.id]);
+		} 
+
+		return infos;
+	},
+
+	//
+	sendMsg: function (authcode, msg) { 
+		var client = this.findClient(authcode);
+		if (client) {
+			sendmsg(client, msg_info, msg);
+		}
     }
 
 }
